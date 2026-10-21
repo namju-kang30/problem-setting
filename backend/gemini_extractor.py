@@ -1,7 +1,8 @@
 import json
 import re
 import io
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from PIL import Image
 from typing import List, Dict, Any, Optional
 from backend.config import DEFAULT_GEMINI_MODEL, GEMINI_MODELS
@@ -35,12 +36,11 @@ PROMPT_DETECT_QUESTIONS = """
 class GeminiExtractor:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
-        if self.api_key:
-            genai.configure(api_key=self.api_key)
+        self.client = genai.Client(api_key=self.api_key) if self.api_key else None
 
     def set_api_key(self, api_key: str):
         self.api_key = api_key
-        genai.configure(api_key=self.api_key)
+        self.client = genai.Client(api_key=self.api_key)
 
     def detect_questions_in_page(
         self,
@@ -61,18 +61,14 @@ class GeminiExtractor:
 
         for model in models_to_try:
             try:
-                gen_model = genai.GenerativeModel(
-                    model_name=model,
-                    generation_config={
-                        "temperature": 0.1,
-                        "response_mime_type": "application/json"
-                    }
+                response = self.client.models.generate_content(
+                    model=model,
+                    contents=[PROMPT_DETECT_QUESTIONS, page_image],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json"
+                    )
                 )
-                
-                response = gen_model.generate_content([
-                    PROMPT_DETECT_QUESTIONS,
-                    page_image
-                ])
                 
                 response_text = response.text.strip()
                 data = self._parse_json_response(response_text)
@@ -84,15 +80,9 @@ class GeminiExtractor:
                         box = item.get("box_2d")
                         if q_num is not None and box and len(box) == 4:
                             ymin, xmin, ymax, xmax = [int(coord) for coord in box]
-                            h_box = ymax - ymin
-
-                            # Discard footer page number box misidentified as a question
-                            if ymin >= 870 and h_box < 60 and (350 <= xmin <= 650 or q_num in [16, 32] or q_num > 30):
+                            # Footer boxes and footer overshoot are removed in backend.main using the page layout
+                            if ymax <= ymin or xmax <= xmin:
                                 continue
-
-                            # Only cap if ymax extends into the footer zone (> 938)
-                            if ymax > 938:
-                                ymax = 932
 
                             results.append({
                                 "question_number": int(q_num),

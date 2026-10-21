@@ -1,4 +1,5 @@
 import pymupdf as fitz
+import io
 import os
 import sys
 from pathlib import Path
@@ -81,7 +82,10 @@ def create_sample_mock_exam_pdf(output_pdf_path: str):
     print(f"Sample mock exam PDF generated: {output_pdf_path} with 20 questions.")
 
 def test_full_pipeline():
-    test_pdf = Path(__file__).resolve().parent / "sample_exam.pdf"
+    # Generated into output/ (git-ignored) so running the test never touches the committed sample_exam.pdf
+    output_dir = Path(__file__).resolve().parent / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    test_pdf = output_dir / "sample_exam.pdf"
     create_sample_mock_exam_pdf(str(test_pdf))
 
     # 1. Process PDF
@@ -109,7 +113,7 @@ def test_full_pipeline():
         p_num = p_idx + 1
         page_images[p_num] = processor.render_page_to_image(p_idx, zoom_ratio=1.30, high_dpi_supersample=2.0)
 
-    cropper = ImageCropper(Path(__file__).resolve().parent / "output")
+    cropper = ImageCropper(output_dir)
     result = cropper.process_and_save_all(
         session_id="test_session",
         page_images=page_images,
@@ -145,5 +149,75 @@ def test_full_pipeline():
 
     print("\n[SUCCESS] Pipeline test passed with flying colors!")
 
+def test_real_exam_layout_features():
+    """
+    Reproduces layout features of real 평가원/교육청 papers that broke detection:
+    - a <보기> box and fraction choices sitting just above the footer page-number box
+    - a raster figure that defines the question's right edge
+    - a subject tab printed in the right page margin
+    """
+    from backend.main import apply_safe_question_margins
+    from backend.rule_extractor import analyze_page_layout, normalized_layout
+
+    W, H = 595, 842
+    doc = fitz.open()
+    page = doc.new_page(width=W, height=H)
+
+    page.draw_line(fitz.Point(40, 60), fitz.Point(555, 60), width=1.2)            # header rule
+    page.draw_line(fitz.Point(297.5, 62), fitz.Point(297.5, 790), width=0.5)      # column divider
+    page.draw_rect(fitz.Rect(565, 300, 585, 380), color=None, fill=(0.6, 0.6, 0.6))  # subject tab
+    page.insert_text(fitz.Point(570, 320), "물리", fontsize=9, fontname="korea")
+
+    # Left column: Q1 whose <보기> box and fraction choices reach down to the footer
+    page.insert_text(fitz.Point(45, 80), "1. 그림은 전하의 배치를 나타낸 것이다.", fontsize=9, fontname="korea")
+    page.draw_rect(fitz.Rect(45, 690, 285, 740), width=0.5)                       # <보기> box
+    page.insert_text(fitz.Point(120, 690), "< 보 기 >", fontsize=8, fontname="korea")
+    page.insert_text(fitz.Point(50, 765), "①", fontsize=9, fontname="korea")
+    page.insert_text(fitz.Point(62, 760), "1", fontsize=7)                        # fraction numerator
+    page.draw_line(fitz.Point(60, 762), fitz.Point(68, 762), width=0.4)            # fraction bar
+    page.insert_text(fitz.Point(62, 770), "4", fontsize=7)                        # fraction denominator
+    page.insert_text(fitz.Point(110, 765), "② 2   ③ 3   ④ 4   ⑤ 5", fontsize=9, fontname="korea")
+
+    # Right column: Q2 with a raster figure reaching the right edge of the column
+    page.insert_text(fitz.Point(305, 80), "2. 그림과 같이 회로를 구성하였다.", fontsize=9, fontname="korea")
+    figure = Image.new("RGB", (200, 80), (90, 90, 90))
+    buf = io.BytesIO()
+    figure.save(buf, format="PNG")
+    page.insert_image(fitz.Rect(400, 100, 552, 160), stream=buf.getvalue())
+    page.insert_text(fitz.Point(305, 190), "① ㄱ   ② ㄴ   ③ ㄷ   ④ ㄱ, ㄴ   ⑤ ㄴ, ㄷ", fontsize=9, fontname="korea")
+
+    # Footer: page number box and copyright notice
+    page.draw_rect(fitz.Rect(280, 800, 315, 818), width=0.5)
+    page.insert_text(fitz.Point(286, 812), "1", fontsize=8)
+    page.insert_text(fitz.Point(302, 812), "4", fontsize=8)
+    page.insert_text(fitz.Point(380, 830), "이 문제지에 관한 저작권은 한국교육과정평가원에 있습니다.", fontsize=7, fontname="korea")
+
+    detected = {q["question_number"]: q for q in RuleExtractor(doc).detect_questions()}
+    assert sorted(detected) == [1, 2], f"Expected questions [1, 2], got {sorted(detected)}"
+
+    def to_pt(box):
+        ymin, xmin, ymax, xmax = box
+        return ymin * H / 1000, xmin * W / 1000, ymax * H / 1000, xmax * W / 1000
+
+    q1_top, _, q1_bottom, _ = to_pt(detected[1]["box_2d"])
+    assert q1_bottom >= 772, f"Q1 choice row (incl. fraction denominator, bottom ~772pt) was cut at {q1_bottom:.1f}pt"
+    assert q1_bottom < 800, f"Q1 box ({q1_bottom:.1f}pt) runs into the footer page-number box at 800pt"
+    assert q1_top > 60, f"Q1 box ({q1_top:.1f}pt) includes the header rule at 60pt"
+
+    _, q2_left, _, q2_right = to_pt(detected[2]["box_2d"])
+    assert q2_right >= 552, f"Q2 figure (right edge 552pt) was cut at {q2_right:.1f}pt"
+    assert q2_right < 565, f"Q2 box ({q2_right:.1f}pt) reaches into the subject tab at 565pt"
+    assert q2_left > 297.5, f"Q2 box ({q2_left:.1f}pt) crosses the column divider"
+
+    # The web API margin pass must keep the same guarantees
+    layouts = {1: normalized_layout(analyze_page_layout(page))}
+    final = {q["question_number"]: q for q in apply_safe_question_margins(list(detected.values()), layouts)}
+    assert 772 <= to_pt(final[1]["box_2d"])[2] < 800, f"Q1 bottom after margins: {to_pt(final[1]['box_2d'])[2]:.1f}pt"
+    assert to_pt(final[2]["box_2d"])[3] < 565, f"Q2 right edge after margins: {to_pt(final[2]['box_2d'])[3]:.1f}pt"
+
+    doc.close()
+    print("[SUCCESS] Real exam layout features handled correctly!")
+
 if __name__ == "__main__":
     test_full_pipeline()
+    test_real_exam_layout_features()

@@ -7,8 +7,10 @@ REQUIRED_MODULES = [
     ("fastapi", "fastapi>=0.110.0"),
     ("uvicorn", "uvicorn[standard]>=0.29.0"),
     ("fitz", "pymupdf>=1.24.0"),
-    ("google.generativeai", "google-generativeai>=0.8.0"),
+    ("google.genai", "google-genai>=1.0.0"),
     ("multipart", "python-multipart>=0.0.9"),
+    ("PIL", "pillow>=10.0.0"),
+    ("numpy", "numpy>=1.24.0"),
     ("pydantic", "pydantic>=2.0.0"),
 ]
 
