@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import shutil
+import threading
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -23,6 +24,10 @@ app = FastAPI(title="모의고사 20문제 130% 자동 분할 추출기", versio
 # Leaving it out stops other websites from calling this local API from the browser.
 
 cropper = ImageCropper(OUTPUT_DIR)
+
+# Endpoints doing slow work are plain `def`, so FastAPI runs them in worker threads and a 20s+ Gemini call
+# no longer freezes every other request. PyMuPDF is not thread-safe, so all PDF parsing/rendering takes this lock.
+PDF_LOCK = threading.Lock()
 
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 IMAGE_FILENAME_PATTERN = re.compile(r"\d{2,3}\.png")
@@ -138,15 +143,14 @@ class VerifyKeyRequest(BaseModel):
     api_key: str
 
 @app.post("/api/verify-gemini-key")
-async def verify_gemini_key(req: VerifyKeyRequest):
+def verify_gemini_key(req: VerifyKeyRequest):
     """Verifies if the provided Gemini API key is valid."""
     try:
         from google import genai
         client = genai.Client(api_key=req.api_key)
         
         # Test candidate models in priority order
-        test_models = [DEFAULT_GEMINI_MODEL, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-        test_models = list(dict.fromkeys(filter(None, test_models)))
+        test_models = list(dict.fromkeys([DEFAULT_GEMINI_MODEL] + GEMINI_MODELS))
         last_error = None
         working_model = None
 
@@ -172,7 +176,7 @@ async def verify_gemini_key(req: VerifyKeyRequest):
         return {"success": False, "message": f"API 키 인증 실패: {str(e)}"}
 
 @app.post("/api/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+def upload_pdf(file: UploadFile = File(...)):
     """
     Receives PDF, saves it, renders page previews, and returns metadata.
     """
@@ -188,6 +192,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
 
     try:
+        PDF_LOCK.acquire()
         processor = PDFProcessor(str(pdf_path))
         page_count = processor.page_count
         pages_info = []
@@ -220,6 +225,8 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF 처리 중 오류 발생: {str(e)}")
+    finally:
+        PDF_LOCK.release()
 
 @app.get("/api/preview/{session_id}/{page_num}")
 async def get_page_preview(session_id: str, page_num: int):
@@ -230,7 +237,7 @@ async def get_page_preview(session_id: str, page_num: int):
     return FileResponse(preview_file, media_type="image/png")
 
 @app.post("/api/detect")
-async def detect_questions(req: DetectRequest):
+def detect_questions(req: DetectRequest):
     """
     Detects question boxes using Gemini AI and/or Rule layout parser.
     """
@@ -239,11 +246,21 @@ async def detect_questions(req: DetectRequest):
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="업로드된 PDF 세션을 찾을 수 없습니다.")
 
-    processor = PDFProcessor(str(pdf_path))
-    layouts = {
-        i + 1: normalized_layout(analyze_page_layout(processor.doc[i]))
-        for i in range(processor.page_count)
-    }
+    with PDF_LOCK:
+        processor = PDFProcessor(str(pdf_path))
+        page_count = processor.page_count
+        layouts = {
+            i + 1: normalized_layout(analyze_page_layout(processor.doc[i]))
+            for i in range(page_count)
+        }
+        # Rule-based detection takes ~0.1s, so it always runs: it is the result in rule mode, the per-page
+        # fallback when Gemini fails, and the exact question bounds in hybrid mode
+        rule_detected = RuleExtractor(processor.doc).detect_questions()
+        processor.close()
+
+    def rule_copy(qs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [dict(q, box_2d=list(q["box_2d"])) for q in qs]
+
     all_detected = []
     detection_log = []
 
@@ -253,8 +270,8 @@ async def detect_questions(req: DetectRequest):
         try:
             gemini_ext = GeminiExtractor(api_key=req.api_key)
             preview_dir = UPLOAD_DIR / session_id / "previews"
-            
-            for page_idx in range(processor.page_count):
+
+            for page_idx in range(page_count):
                 page_num = page_idx + 1
                 from PIL import Image
                 page_img = Image.open(preview_dir / f"page_{page_num}.png")
@@ -270,19 +287,13 @@ async def detect_questions(req: DetectRequest):
                 except Exception as e:
                     detection_log.append(f"{page_num}페이지 Gemini 감지 실패 ({str(e)}), 룰베이스 분석으로 전환")
                     # Fallback for this page
-                    rule_ext = RuleExtractor(processor.doc)
-                    rule_results = [q for q in rule_ext.detect_questions() if q["page_num"] == page_num]
-                    all_detected.extend(rule_results)
+                    all_detected.extend(rule_copy([q for q in rule_detected if q["page_num"] == page_num]))
         except Exception as e:
             detection_log.append(f"Gemini API 전체 오류: {str(e)}. 전체 룰베이스 분석 적용.")
-            rule_ext = RuleExtractor(processor.doc)
-            all_detected = rule_ext.detect_questions()
+            all_detected = rule_copy(rule_detected)
     else:
         detection_log.append("자체 레이아웃 룰베이스 분석기를 사용하여 문제 영역을 감지합니다.")
-        rule_ext = RuleExtractor(processor.doc)
-        all_detected = rule_ext.detect_questions()
-
-    processor.close()
+        all_detected = rule_copy(rule_detected)
 
     # Filter out false detections first, so a page number box ('9/32') labeled as question 9 cannot
     # win deduplication over the real question 9: a box starting inside the footer is never a question
@@ -300,27 +311,29 @@ async def detect_questions(req: DetectRequest):
             seen_qnums[qn] = True
             unique_detected.append(q)
 
-    # Hybrid Refinement: If Gemini was used, cross-reference with RuleExtractor to guarantee
-    # that boxes stop right below choices and never overlap footer page numbers / copyright notices
-    if use_gemini:
-        try:
-            processor_refine = PDFProcessor(str(pdf_path))
-            rule_refine = RuleExtractor(processor_refine.doc)
-            rule_boxes = {r["question_number"]: r for r in rule_refine.detect_questions()}
-            processor_refine.close()
-
-            for q in unique_detected:
-                qn = q.get("question_number")
-                if qn in rule_boxes:
-                    r_box = rule_boxes[qn]["box_2d"]
-                    # If Gemini ymax is significantly lower than choice-anchored rule ymax (footer overshoot)
-                    if q["box_2d"][2] > r_box[2] + 25:
-                        q["box_2d"][2] = r_box[2]
-                    # If Gemini xmax is significantly wider than rule xmax
-                    if q["box_2d"][3] > r_box[3] + 30:
-                        q["box_2d"][3] = r_box[3]
-        except Exception:
-            pass
+    # Hybrid: Gemini decides which questions are on each page. Wherever the PDF text layer locates the same
+    # question on the same page, its bounds (question number down to the choice row) replace Gemini's
+    # estimate, which can stop short of the choices. Questions Gemini missed are filled in from the rule result.
+    if use_gemini and req.detection_mode == "hybrid":
+        rule_by_key = {(r["page_num"], r["question_number"]): r for r in rule_detected}
+        corrected = 0
+        for q in unique_detected:
+            r = rule_by_key.get((q.get("page_num"), q.get("question_number")))
+            if r and q.get("source") == "gemini":
+                q["box_2d"] = list(r["box_2d"])
+                q["source"] = "hybrid"
+                corrected += 1
+        added = 0
+        for r in rule_copy(rule_detected):
+            if r["question_number"] not in seen_qnums:
+                seen_qnums[r["question_number"]] = True
+                unique_detected.append(r)
+                added += 1
+        if corrected or added:
+            detection_log.append(
+                f"룰베이스 보정: {corrected}개 문제 영역을 PDF 텍스트 기준으로 보정"
+                + (f", Gemini가 놓친 {added}개 문제 추가" if added else "")
+            )
 
     # Apply safe margins to all detected question boxes
     unique_detected = apply_safe_question_margins(unique_detected, layouts)
@@ -335,7 +348,7 @@ async def detect_questions(req: DetectRequest):
     }
 
 @app.post("/api/crop")
-async def crop_questions(req: CropRequest):
+def crop_questions(req: CropRequest):
     """
     Renders pages at 130% zoom (or requested ratio) and crops detected questions safely.
     Uses page-by-page streaming to keep RAM usage minimal (prevents OOM / Windows freezing).
@@ -349,7 +362,8 @@ async def crop_questions(req: CropRequest):
     zoom_ratio = req.zoom_ratio or DEFAULT_ZOOM_RATIO
     padding = req.padding if req.padding is not None else 9
 
-    processor = PDFProcessor(str(pdf_path))
+    with PDF_LOCK:
+        processor = PDFProcessor(str(pdf_path))
     q_dicts = [q.model_dump() for q in req.questions]
     
     # Group questions by page
@@ -366,7 +380,8 @@ async def crop_questions(req: CropRequest):
     for p_num in sorted(questions_by_page.keys()):
         page_idx = p_num - 1
         if 0 <= page_idx < processor.page_count:
-            page_img = processor.render_page_to_image(page_idx, zoom_ratio=zoom_ratio, high_dpi_supersample=2.0)
+            with PDF_LOCK:
+                page_img = processor.render_page_to_image(page_idx, zoom_ratio=zoom_ratio, high_dpi_supersample=2.0)
             
             for q in questions_by_page[p_num]:
                 item = cropper.save_cropped_question(
@@ -380,7 +395,8 @@ async def crop_questions(req: CropRequest):
             del page_img
             gc.collect()
 
-    processor.close()
+    with PDF_LOCK:
+        processor.close()
 
     # Sort results by question number
     cropped_items.sort(key=lambda x: x.get("question_number", 0))
