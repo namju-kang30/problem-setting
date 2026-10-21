@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import shutil
 from pathlib import Path
@@ -8,7 +9,6 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from backend.config import BASE_DIR, UPLOAD_DIR, OUTPUT_DIR, STATIC_DIR, DEFAULT_ZOOM_RATIO, DEFAULT_GEMINI_MODEL, GEMINI_MODELS
@@ -19,15 +19,19 @@ from backend.image_cropper import ImageCropper
 
 app = FastAPI(title="모의고사 20문제 130% 자동 분할 추출기", version="1.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# The web UI is served from this same app, so no CORS middleware is needed.
+# Leaving it out stops other websites from calling this local API from the browser.
 
 cropper = ImageCropper(OUTPUT_DIR)
+
+SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+IMAGE_FILENAME_PATTERN = re.compile(r"\d{2,3}\.png")
+
+def validate_session_id(session_id: str) -> str:
+    """Rejects session IDs that could escape the upload/output directories (e.g. '../')."""
+    if not SESSION_ID_PATTERN.fullmatch(session_id):
+        raise HTTPException(status_code=400, detail="잘못된 세션 ID입니다.")
+    return session_id
 
 def apply_safe_question_margins(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -116,8 +120,8 @@ class VerifyKeyRequest(BaseModel):
 async def verify_gemini_key(req: VerifyKeyRequest):
     """Verifies if the provided Gemini API key is valid."""
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=req.api_key)
+        from google import genai
+        client = genai.Client(api_key=req.api_key)
         
         # Test candidate models in priority order
         test_models = [DEFAULT_GEMINI_MODEL, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
@@ -127,8 +131,7 @@ async def verify_gemini_key(req: VerifyKeyRequest):
 
         for m_name in test_models:
             try:
-                model = genai.GenerativeModel(m_name)
-                resp = model.generate_content("Hello! Respond with 'OK'.")
+                client.models.generate_content(model=m_name, contents="Hello! Respond with 'OK'.")
                 working_model = m_name
                 break
             except Exception as e:
@@ -199,6 +202,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.get("/api/preview/{session_id}/{page_num}")
 async def get_page_preview(session_id: str, page_num: int):
+    validate_session_id(session_id)
     preview_file = UPLOAD_DIR / session_id / "previews" / f"page_{page_num}.png"
     if not preview_file.exists():
         raise HTTPException(status_code=404, detail="미리보기 이미지를 찾을 수 없습니다.")
@@ -209,7 +213,7 @@ async def detect_questions(req: DetectRequest):
     """
     Detects question boxes using Gemini AI and/or Rule layout parser.
     """
-    session_id = req.session_id
+    session_id = validate_session_id(req.session_id)
     pdf_path = UPLOAD_DIR / session_id / "exam.pdf"
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="업로드된 PDF 세션을 찾을 수 없습니다.")
@@ -326,7 +330,7 @@ async def crop_questions(req: CropRequest):
     Uses page-by-page streaming to keep RAM usage minimal (prevents OOM / Windows freezing).
     """
     import gc
-    session_id = req.session_id
+    session_id = validate_session_id(req.session_id)
     pdf_path = UPLOAD_DIR / session_id / "exam.pdf"
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="업로드된 PDF 세션을 찾을 수 없습니다.")
@@ -389,6 +393,9 @@ async def crop_questions(req: CropRequest):
 
 @app.get("/api/image/{session_id}/{filename}")
 async def get_cropped_image(session_id: str, filename: str):
+    validate_session_id(session_id)
+    if not IMAGE_FILENAME_PATTERN.fullmatch(filename):
+        raise HTTPException(status_code=400, detail="잘못된 파일 이름입니다.")
     image_file = OUTPUT_DIR / session_id / filename
     if not image_file.exists():
         raise HTTPException(status_code=404, detail="이미지를 찾을 수 없습니다.")
@@ -396,6 +403,7 @@ async def get_cropped_image(session_id: str, filename: str):
 
 @app.get("/api/download-zip/{session_id}")
 async def download_zip(session_id: str):
+    validate_session_id(session_id)
     zip_file = OUTPUT_DIR / session_id / f"questions_{session_id}.zip"
     if not zip_file.exists():
         raise HTTPException(status_code=404, detail="압축 파일을 찾을 수 없습니다.")

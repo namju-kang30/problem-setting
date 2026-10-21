@@ -81,7 +81,10 @@ def create_sample_mock_exam_pdf(output_pdf_path: str):
     print(f"Sample mock exam PDF generated: {output_pdf_path} with 20 questions.")
 
 def test_full_pipeline():
-    test_pdf = Path(__file__).resolve().parent / "sample_exam.pdf"
+    # Generated into output/ (git-ignored) so running the test never touches the committed sample_exam.pdf
+    output_dir = Path(__file__).resolve().parent / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    test_pdf = output_dir / "sample_exam.pdf"
     create_sample_mock_exam_pdf(str(test_pdf))
 
     # 1. Process PDF
@@ -109,7 +112,7 @@ def test_full_pipeline():
         p_num = p_idx + 1
         page_images[p_num] = processor.render_page_to_image(p_idx, zoom_ratio=1.30, high_dpi_supersample=2.0)
 
-    cropper = ImageCropper(Path(__file__).resolve().parent / "output")
+    cropper = ImageCropper(output_dir)
     result = cropper.process_and_save_all(
         session_id="test_session",
         page_images=page_images,
