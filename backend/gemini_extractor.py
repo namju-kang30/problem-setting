@@ -55,8 +55,7 @@ class GeminiExtractor:
         if not self.api_key:
             raise ValueError("Google Gemini API Key is required for AI detection.")
 
-        candidates = [model_name, DEFAULT_GEMINI_MODEL, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-        models_to_try = list(dict.fromkeys(filter(None, candidates)))
+        models_to_try = list(dict.fromkeys(filter(None, [model_name, DEFAULT_GEMINI_MODEL] + GEMINI_MODELS)))
         last_error = None
 
         for model in models_to_try:

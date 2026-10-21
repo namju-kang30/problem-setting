@@ -218,6 +218,63 @@ def test_real_exam_layout_features():
     doc.close()
     print("[SUCCESS] Real exam layout features handled correctly!")
 
+def test_detect_modes_with_gemini_mistakes():
+    """
+    Gemini output varies between runs; on real papers it sometimes stopped short of the choice row,
+    labeled the footer page box as a question, or missed a question. Hybrid mode must correct all three,
+    while Gemini-only mode returns Gemini's own boxes.
+    """
+    from unittest import mock
+    from fastapi.testclient import TestClient
+    from backend.main import app
+
+    output_dir = Path(__file__).resolve().parent / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    test_pdf = output_dir / "sample_exam.pdf"
+    create_sample_mock_exam_pdf(str(test_pdf))
+
+    with fitz.open(str(test_pdf)) as doc:
+        rule = {q["question_number"]: q for q in RuleExtractor(doc).detect_questions()}
+
+    def fake_gemini(self, page_image, page_num, model_name):
+        results = []
+        for q in rule.values():
+            if q["page_num"] != page_num or q["question_number"] == 7:  # Gemini misses question 7
+                continue
+            ymin, xmin, ymax, xmax = q["box_2d"]
+            if q["question_number"] == 3:
+                ymax = ymin + (ymax - ymin) // 2  # stops halfway, above the choice row
+            results.append({"question_number": q["question_number"], "box_2d": [ymin, xmin, ymax, xmax],
+                            "page_num": page_num, "source": "gemini"})
+        if page_num == 1:
+            # Footer page number box ("1 / 4") labeled as question 9, ahead of the real question 9
+            results.insert(0, {"question_number": 9, "box_2d": [960, 460, 975, 540], "page_num": 1, "source": "gemini"})
+        return results
+
+    client = TestClient(app)
+    with open(test_pdf, "rb") as f:
+        session_id = client.post("/api/upload", files={"file": ("exam.pdf", f, "application/pdf")}).json()["session_id"]
+
+    detected = {}
+    with mock.patch("backend.main.GeminiExtractor.detect_questions_in_page", fake_gemini):
+        for mode in ["hybrid", "gemini"]:
+            res = client.post("/api/detect", json={"session_id": session_id, "api_key": "test", "detection_mode": mode})
+            assert res.status_code == 200, res.text
+            detected[mode] = {q["question_number"]: q for q in res.json()["questions"]}
+
+    hybrid = detected["hybrid"]
+    assert sorted(hybrid) == list(range(1, 21)), f"Hybrid should detect 1~20, got {sorted(hybrid)}"
+    assert hybrid[9]["page_num"] == rule[9]["page_num"], "Footer box labeled 9 replaced the real question 9"
+    assert hybrid[3]["box_2d"][2] >= rule[3]["box_2d"][2], "Hybrid kept Gemini's box that stops above the choices"
+    assert hybrid[7]["source"] == "rule", "Question 7 missed by Gemini should be filled in from the rule result"
+
+    gemini_only = detected["gemini"]
+    assert 7 not in gemini_only, "Gemini-only mode must not mix in rule-based results"
+    assert gemini_only[3]["box_2d"][2] < rule[3]["box_2d"][2], "Gemini-only mode must not apply rule correction"
+
+    print("[SUCCESS] Gemini/hybrid detection modes behave as labeled!")
+
 if __name__ == "__main__":
     test_full_pipeline()
     test_real_exam_layout_features()
+    test_detect_modes_with_gemini_mistakes()
