@@ -80,15 +80,9 @@ class GeminiExtractor:
                         box = item.get("box_2d")
                         if q_num is not None and box and len(box) == 4:
                             ymin, xmin, ymax, xmax = [int(coord) for coord in box]
-                            h_box = ymax - ymin
-
-                            # Discard footer page number box misidentified as a question
-                            if ymin >= 870 and h_box < 60 and (350 <= xmin <= 650 or q_num in [16, 32] or q_num > 30):
+                            # Footer boxes and footer overshoot are removed in backend.main using the page layout
+                            if ymax <= ymin or xmax <= xmin:
                                 continue
-
-                            # Only cap if ymax extends into the footer zone (> 938)
-                            if ymax > 938:
-                                ymax = 932
 
                             results.append({
                                 "question_number": int(q_num),

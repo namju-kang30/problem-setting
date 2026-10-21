@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from backend.config import BASE_DIR, UPLOAD_DIR, OUTPUT_DIR, STATIC_DIR, DEFAULT_ZOOM_RATIO, DEFAULT_GEMINI_MODEL, GEMINI_MODELS
 from backend.pdf_processor import PDFProcessor
 from backend.gemini_extractor import GeminiExtractor
-from backend.rule_extractor import RuleExtractor
+from backend.rule_extractor import RuleExtractor, analyze_page_layout, normalized_layout
 from backend.image_cropper import ImageCropper
 
 app = FastAPI(title="모의고사 20문제 130% 자동 분할 추출기", version="1.0.0")
@@ -33,11 +33,15 @@ def validate_session_id(session_id: str) -> str:
         raise HTTPException(status_code=400, detail="잘못된 세션 ID입니다.")
     return session_id
 
-def apply_safe_question_margins(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def apply_safe_question_margins(
+    questions: List[Dict[str, Any]],
+    layouts: Optional[Dict[int, Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
     """
     Guarantees generous, balanced top/bottom/left/right margins for every question bounding box,
     preventing any text, formulas, diagrams, tables, or choices from being clipped.
     Maintains clean separation between adjacent questions and respects page margins/footers.
+    layouts: per-page normalized layout (see normalized_layout); without it, typical CSAT positions are assumed.
     """
     if not questions:
         return questions
@@ -50,25 +54,42 @@ def apply_safe_question_margins(questions: List[Dict[str, Any]]) -> List[Dict[st
     result = []
 
     for p_num, page_qs in pages.items():
+        layout = (layouts or {}).get(p_num)
+        if layout:
+            page_mid = layout["mid_x"]
+            columns = layout["columns"]
+            header_bottom = layout["header_bottom"]
+            header_top_limit = header_bottom + 1 if header_bottom is not None else 50
+            footer_top = layout["footer_top"]
+        else:
+            page_mid = 500
+            columns = [(10, 497), (504, 990)]
+            # Page header boundary limit to prevent top black divider lines on top questions
+            header_top_limit = 210 if p_num == 1 else 127
+            footer_top = 938
+
         left_col = []
         right_col = []
         for q in page_qs:
             box = q.get("box_2d", [0, 0, 0, 0])
             mid_x = (box[1] + box[3]) / 2.0
-            if mid_x < 500:
+            if mid_x < page_mid:
                 left_col.append(q)
             else:
                 right_col.append(q)
 
-        for col, (col_min, col_max) in [(left_col, (10, 497)), (right_col, (504, 990))]:
+        for col, (col_min, col_max) in zip([left_col, right_col], columns):
             col.sort(key=lambda item: item["box_2d"][0])
             for i, q in enumerate(col):
                 ymin, xmin, ymax, xmax = q["box_2d"]
+                if layout:
+                    # Keep AI boxes out of the footer and the margins outside the column (e.g. the subject tab)
+                    ymax = min(ymax, footer_top - 1)
+                    xmin = max(xmin, col_min)
+                    xmax = min(xmax, col_max)
 
-                # Page header boundary limit to prevent top black divider lines on top questions
-                header_top_limit = 210 if p_num == 1 else 127
                 prev_bottom = col[i - 1]["box_2d"][2] if i > 0 else header_top_limit
-                next_top = col[i + 1]["box_2d"][0] if i + 1 < len(col) else 936
+                next_top = col[i + 1]["box_2d"][0] if i + 1 < len(col) else footer_top - 2
 
                 # Expand top: give at least 6 units margin, staying clear of prev question and page header line
                 safe_ymin = max(prev_bottom + 2, ymin - 6)
@@ -219,6 +240,10 @@ async def detect_questions(req: DetectRequest):
         raise HTTPException(status_code=404, detail="업로드된 PDF 세션을 찾을 수 없습니다.")
 
     processor = PDFProcessor(str(pdf_path))
+    layouts = {
+        i + 1: normalized_layout(analyze_page_layout(processor.doc[i]))
+        for i in range(processor.page_count)
+    }
     all_detected = []
     detection_log = []
 
@@ -259,6 +284,13 @@ async def detect_questions(req: DetectRequest):
 
     processor.close()
 
+    # Filter out false detections first, so a page number box ('9/32') labeled as question 9 cannot
+    # win deduplication over the real question 9: a box starting inside the footer is never a question
+    all_detected = [
+        q for q in all_detected
+        if q["box_2d"][0] < layouts.get(q.get("page_num"), {}).get("footer_top", 1000) - 5
+    ]
+
     # Deduplicate and sort by question number
     seen_qnums = {}
     unique_detected = []
@@ -290,29 +322,8 @@ async def detect_questions(req: DetectRequest):
         except Exception:
             pass
 
-    # Filter out false detections (such as footer page number box '1/32' or '32')
-    valid_detected = []
-    for q in unique_detected:
-        qn = q.get("question_number", 0)
-        box = q.get("box_2d", [0, 0, 0, 0])
-        ymin, xmin, ymax, xmax = box
-        h_box = ymax - ymin
-
-        # The footer page number box is located in footer region (ymin >= 870) with small height (< 60)
-        is_page_box = (
-            ymin >= 870 and h_box < 60 and (
-                (350 <= xmin <= 550 and 450 <= xmax <= 650) or
-                (qn in [16, 32, 20, 1, 2] and ymin >= 880 and h_box < 55) or
-                qn > 30
-            )
-        )
-        if is_page_box:
-            continue
-        valid_detected.append(q)
-    unique_detected = valid_detected
-
     # Apply safe margins to all detected question boxes
-    unique_detected = apply_safe_question_margins(unique_detected)
+    unique_detected = apply_safe_question_margins(unique_detected, layouts)
     unique_detected.sort(key=lambda x: x.get("question_number", 0))
 
     return {
